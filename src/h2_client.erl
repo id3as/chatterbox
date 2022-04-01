@@ -20,6 +20,7 @@
          start_link/3,
          start_link/4,
          start_link/5,
+         start_link/6,
          start/4,
          start/5,
          start_ssl_upgrade_link/4,
@@ -78,18 +79,20 @@ start_link(https,Host) ->
                       | {error, term()}.
 start_link(http, Host, Port)
   when is_integer(Port) ->
-    start_link(http, Host, Port, []);
+    {ok, SocketOptions} = application:get_env(chatterbox, socket_options, []),
+    start_link(http, Host, Port, SocketOptions, []);
 start_link(https, Host, Port)
   when is_integer(Port) ->
+    {ok, SocketOptions} = application:get_env(chatterbox, socket_options, []),
     {ok, SSLOptions} = application:get_env(chatterbox, ssl_options),
     DefaultSSLOptions = [
                          {client_preferred_next_protocols, {client, [<<"h2">>]}}|
                          SSLOptions
                         ],
-    start_link(https, Host, Port, DefaultSSLOptions);
-start_link(https, Host, SSLOptions)
-  when is_list(SSLOptions) ->
-    start_link(https, Host, 443, SSLOptions).
+    start_link(https, Host, Port, SocketOptions, DefaultSSLOptions).
+start_link(https, Host, SocketOptions, SSLOptions)
+  when is_list(SocketOptions), is_list(SSLOptions) ->
+    start_link(https, Host, 443, SocketOptions, SSLOptions).
 
 
 %% Here's your all access client starter. MAXIMUM TUNABLES! Scheme,
@@ -104,15 +107,15 @@ start_link(https, Host, SSLOptions)
                         {ok, pid()}
                       | ignore
                       | {error, term()}.
-start_link(Transport, Host, Port, SSLOptions) ->
-    start_link(Transport, Host, Port, SSLOptions, #{}).
+start_link(Transport, Host, Port, SocketOptions, SSLOptions) ->
+    start_link(Transport, Host, Port, SocketOptions, SSLOptions, #{}).
 
-start_link(Transport, Host, Port, SSLOptions, ConnectionSettings) ->
+start_link(Transport, Host, Port, SocketOptions, SSLOptions, ConnectionSettings) ->
     NewT = case Transport of
                http -> gen_tcp;
                https -> ssl
            end,
-    h2_connection:start_client_link(NewT, Host, Port, SSLOptions, chatterbox:settings(client), ConnectionSettings).
+    h2_connection:start_client_link(NewT, Host, Port, SocketOptions, SSLOptions, chatterbox:settings(client), ConnectionSettings).
 
 -spec start(http | https,
                  string(),

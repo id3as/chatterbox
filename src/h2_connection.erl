@@ -5,9 +5,9 @@
 %% Start/Stop API
 -export([
          start_client/2,
-         start_client/6,
+         start_client/7,
          start_client_link/2,
-         start_client_link/6,
+         start_client_link/7,
          start_ssl_upgrade_link/6,
          start_server_link/3,
          become/1,
@@ -121,24 +121,26 @@
 -spec start_client_link(gen_tcp | ssl,
                         inet:ip_address() | inet:hostname(),
                         inet:port_number(),
+                        [gen_tcp:option()],
                         [ssl:ssl_option()],
                         settings(),
                         maps:map()
                        ) ->
                                {ok, pid()} | ignore | {error, term()}.
-start_client_link(Transport, Host, Port, SSLOptions, Http2Settings, ConnectionSettings) ->
-    gen_statem:start_link(?MODULE, {client, Transport, Host, Port, SSLOptions, Http2Settings, ConnectionSettings}, []).
+start_client_link(Transport, Host, Port, SocketOptions, SSLOptions, Http2Settings, ConnectionSettings) ->
+    gen_statem:start_link(?MODULE, {client, Transport, Host, Port, SocketOptions, SSLOptions, Http2Settings, ConnectionSettings}, []).
 
 -spec start_client(gen_tcp | ssl,
                         inet:ip_address() | inet:hostname(),
                         inet:port_number(),
+                        [gen_tcp:option()],
                         [ssl:ssl_option()],
                         settings(),
                         map()
                        ) ->
                                {ok, pid()} | ignore | {error, term()}.
-start_client(Transport, Host, Port, SSLOptions, Http2Settings, ConnectionSettings) ->
-    gen_statem:start(?MODULE, {client, Transport, Host, Port, SSLOptions, Http2Settings, ConnectionSettings}, []).
+start_client(Transport, Host, Port, SocketOptions, SSLOptions, Http2Settings, ConnectionSettings) ->
+    gen_statem:start(?MODULE, {client, Transport, Host, Port, SocketOptions, SSLOptions, Http2Settings, ConnectionSettings}, []).
 
 -spec start_client_link(socket(),
                         settings()
@@ -205,9 +207,9 @@ become({Transport, Socket}, Http2Settings, ConnectionSettings) ->
     end.
 
 %% Init callback
-init({client, Transport, Host, Port, SSLOptions, Http2Settings, ConnectionSettings}) ->
+init({client, Transport, Host, Port, SocketOptions, SSLOptions, Http2Settings, ConnectionSettings}) ->
     ConnectTimeout = maps:get(connect_timeout, ConnectionSettings, 5000),
-    case Transport:connect(Host, Port, client_options(Transport, SSLOptions), ConnectTimeout) of
+    case Transport:connect(Host, Port, client_options(Transport, SocketOptions, SSLOptions), ConnectTimeout) of
         {ok, Socket} ->
             ok = sock:setopts({Transport, Socket}, [{packet, raw}, binary, {active, once}]),
             Transport:send(Socket, <<?PREFACE>>),
@@ -234,7 +236,7 @@ init({client_ssl_upgrade, Host, Port, InitialMessage, SSLOptions, Http2Settings,
     case gen_tcp:connect(Host, Port, [{active, false}], ConnectTimeout) of
         {ok, TCP} ->
             gen_tcp:send(TCP, InitialMessage),
-            case ssl:connect(TCP, client_options(ssl, SSLOptions)) of
+            case ssl:connect(TCP, client_options(ssl, [], SSLOptions)) of
                 {ok, Socket} ->
                     ok = ssl:setopts(Socket, [{packet, raw}, binary, {active, once}]),
                     ssl:send(Socket, <<?PREFACE>>),
@@ -1457,7 +1459,7 @@ send_ack_timeout(SS) ->
 active_once(Socket) ->
     sock:setopts(Socket, [{active, once}]).
 
-client_options(Transport, SSLOptions) ->
+client_options(Transport, SocketOptions, SSLOptions) ->
     ClientSocketOptions = [
                            binary,
                            {packet, raw},
@@ -1465,9 +1467,9 @@ client_options(Transport, SSLOptions) ->
                           ],
     case Transport of
         ssl ->
-            [{alpn_advertised_protocols, [<<"h2">>]}|ClientSocketOptions ++ SSLOptions];
+            [{alpn_advertised_protocols, [<<"h2">>]}|ClientSocketOptions ++ SocketOptions ++ SSLOptions];
         gen_tcp ->
-            ClientSocketOptions
+            ClientSocketOptions ++ SocketOptions
     end.
 
 start_http2_server(
