@@ -722,9 +722,9 @@ s_send_what_we_can(SWS, MFS, #active_stream{}=Stream) ->
     {Frame, SentBytes, NewS} =
         case MaxToSend > QueueSize of
             true ->
-                Flags = case Stream#active_stream.body_complete of
-                         true -> ?FLAG_END_STREAM;
-                         false -> 0
+                Flags = case {Stream#active_stream.body_complete, Stream#active_stream.trailers} of
+                         {true, undefined} -> ?FLAG_END_STREAM;
+                         _ -> 0
                         end,
                 %% We have the power to send everything
                 {{#frame_header{
