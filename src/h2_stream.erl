@@ -7,6 +7,7 @@
          send_event/2,
          send_pp/2,
          send_data/2,
+         send_trailers/2,
          stream_id/0,
          call/2,
          connection/0,
@@ -125,9 +126,14 @@ send_pp(Pid, Headers) ->
     gen_statem:cast(Pid, {send_pp, Headers}).
 
 -spec send_data(pid(), h2_frame_data:frame()) ->
-                        ok | flow_control.
+                        ok.
 send_data(Pid, Frame) ->
     gen_statem:cast(Pid, {send_data, Frame}).
+
+-spec send_trailers(pid(), hpack:header()) ->
+                        ok.
+send_trailers(Pid, Trailers) ->
+    gen_statem:cast(Pid, {send_trailers, Trailers}).
 
 -spec stream_id() -> stream_id().
 stream_id() ->
@@ -457,24 +463,6 @@ open(cast, {recv_h, Headers},
   end;
 open(cast, {send_data,
       {#frame_header{
-          type=?HEADERS,
-          flags=Flags
-         }, _}=F},
-     #stream_state{
-        socket=Socket
-       }=Stream) ->
-    sock:send(Socket, h2_frame:to_binary(F)),
-
-    NextState =
-        case ?IS_FLAG(Flags, ?FLAG_END_STREAM) of
-            true ->
-                half_closed_local;
-            _ ->
-                open
-        end,
-    {next_state, NextState, Stream};
-open(cast, {send_data,
-      {#frame_header{
           type=?DATA,
           flags=Flags
          }, _}=F},
@@ -491,6 +479,14 @@ open(cast, {send_data,
                 open
         end,
     {next_state, NextState, Stream};
+open(cast, {send_trailers, Trailers},
+     #stream_state{
+        connection = ConnPid,
+        stream_id = StreamId
+       }=Stream) ->
+    h2_connection:encode_and_send_trailers(ConnPid, StreamId, Trailers),
+    {next_state, half_closed_local, Stream};
+
 open(cast,
   {send_h, Headers},
   #stream_state{}=Stream) ->
@@ -548,30 +544,15 @@ half_closed_remote(cast,
             {next_state, closed, Stream, 0}
     end;
 half_closed_remote(cast,
-                  {send_data,
-                   {
-                     #frame_header{
-                        flags=Flags,
-                        type=?HEADERS
-                       },_
-                   }=F}=_Msg,
-  #stream_state{
-     socket=Socket
-    }=Stream) ->
-    case sock:send(Socket, h2_frame:to_binary(F)) of
-        ok ->
-            case ?IS_FLAG(Flags, ?FLAG_END_STREAM) of
-                true ->
-                    {next_state, closed, Stream, 0};
-                _ ->
-                    {next_state, half_closed_remote, Stream}
-            end;
-        {error,_} ->
-            {next_state, closed, Stream, 0}
-    end;
+                  {send_trailers, Trailers},
+                   #stream_state{
+                      connection = ConnPid,
+                      stream_id = StreamId
+                     }=Stream) ->
+  h2_connection:encode_and_send_trailers(ConnPid, StreamId, Trailers),
+  {next_state, half_closed_remote, Stream};
 
-
-half_closed_remote(cast, _,
+half_closed_remote(cast, _Msg,
        #stream_state{}=Stream) ->
     rst_stream_(?STREAM_CLOSED, Stream);
 half_closed_remote(Type, Event, State) ->

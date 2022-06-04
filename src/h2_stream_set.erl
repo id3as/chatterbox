@@ -80,7 +80,7 @@
      queued_data           :: undefined | done | binary(),
      % Has the body been completely recieved.
      body_complete = false :: boolean(),
-     trailers = undefined  :: [h2_frame:frame()] | undefined
+     trailers = undefined  :: hpack:headers() | undefined
     }).
 -type active_stream() :: #active_stream{}.
 
@@ -679,7 +679,7 @@ s_send_what_we_can(SWS, _, #active_stream{queued_data=Data,
                                           pid=Pid,
                                           trailers=Trailers}=S)
   when is_atom(Data) ->
-    [h2_stream:send_data(Pid, Frame) || Frame <- Trailers],
+    h2_stream:send_trailers(Pid, Trailers),
     {SWS, S#active_stream{trailers=undefined}};
 s_send_what_we_can(SWS, MFS, #active_stream{}=Stream) ->
     %% We're coming in here with three numbers we need to look at:
@@ -704,7 +704,6 @@ s_send_what_we_can(SWS, MFS, #active_stream{}=Stream) ->
     %% If it was stream send_window size, we're blocked on this
     %% stream, but other streams can still go, so we'll break out of
     %% this recursion, but not the connection level
-
     SSWS = Stream#active_stream.send_window_size,
     QueueSize = byte_size(Stream#active_stream.queued_data),
 
@@ -760,7 +759,7 @@ s_send_what_we_can(SWS, MFS, #active_stream{}=Stream) ->
                 #active_stream{pid=Pid,
                                queued_data=done,
                                trailers=Trailers1} ->
-                    [h2_stream:send_data(Pid, Trailer) || Trailer <- Trailers1],
+                    h2_stream:send_trailers(Pid, Trailers1),
                     NewS#active_stream{trailers=undefined};
                 _ ->
                     NewS

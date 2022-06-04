@@ -22,6 +22,7 @@
          send_headers/4,
          send_trailers/3,
          send_trailers/4,
+         encode_and_send_trailers/3,
          send_body/3,
          send_body/4,
          send_request/3,
@@ -292,8 +293,7 @@ send_frame(Pid, Frame) ->
 
 -spec send_headers(pid(), stream_id(), hpack:headers()) -> ok.
 send_headers(Pid, StreamId, Headers) ->
-    gen_statem:cast(Pid, {send_headers, StreamId, Headers, []}),
-    ok.
+    send_headers(Pid, StreamId, Headers, []).
 
 -spec send_headers(pid(), stream_id(), hpack:headers(), send_opts()) -> ok.
 send_headers(Pid, StreamId, Headers, Opts) ->
@@ -302,18 +302,22 @@ send_headers(Pid, StreamId, Headers, Opts) ->
 
 -spec send_trailers(pid(), stream_id(), hpack:headers()) -> ok.
 send_trailers(Pid, StreamId, Trailers) ->
-    gen_statem:cast(Pid, {send_trailers, StreamId, Trailers, []}),
-    ok.
+    send_trailers(Pid, StreamId, Trailers, []).
 
 -spec send_trailers(pid(), stream_id(), hpack:headers(), send_opts()) -> ok.
 send_trailers(Pid, StreamId, Trailers, Opts) ->
     gen_statem:cast(Pid, {send_trailers, StreamId, Trailers, Opts}),
     ok.
 
+-spec encode_and_send_trailers(pid(), stream_id(), hpack:headers()) -> ok.
+encode_and_send_trailers(Pid, StreamId, Trailers) ->
+    gen_statem:cast(Pid, {encode_and_send_trailers, StreamId, Trailers}),
+    ok.
+
 -spec send_body(pid(), stream_id(), binary()) -> ok.
 send_body(Pid, StreamId, Body) ->
-    gen_statem:cast(Pid, {send_body, StreamId, Body, []}),
-    ok.
+    send_body(Pid, StreamId, Body, []).
+
 -spec send_body(pid(), stream_id(), binary(), send_opts()) -> ok.
 send_body(Pid, StreamId, Body, Opts) ->
     gen_statem:cast(Pid, {send_body, StreamId, Body, Opts}),
@@ -881,7 +885,6 @@ route_frame(
             %% TODO: Priority Sort! Right now, it's just sorting on
             %% lowest stream_id first
             Streams = h2_stream_set:sort(Conn#connection.streams),
-
             {RemainingSendWindow, UpdatedStreams} =
                 h2_stream_set:send_what_we_can(
                   all,
@@ -997,26 +1000,17 @@ handle_event(_, {update_settings, Http2Settings},
      send_settings(Http2Settings, Conn)};
 handle_event(_, {send_headers, StreamId, Headers, Opts}, Conn) ->
     send_headers_(StreamId, Headers, Opts, Conn);
-handle_event(_, {send_trailers, StreamId, Headers, Opts},
+handle_event(_, {send_trailers, StreamId, Trailers, Opts},
              #connection{
-                encode_context=EncodeContext,
                 streams = Streams,
                 socket = _Socket
                }=Conn
             ) ->
     BodyComplete = proplists:get_value(send_end_stream, Opts, true),
-
     Stream = h2_stream_set:get(StreamId, Streams),
     case h2_stream_set:type(Stream) of
         active ->
-            {FramesToSend, NewContext} =
-                h2_frame_headers:to_frames(h2_stream_set:stream_id(Stream),
-                                           Headers,
-                                           EncodeContext,
-                                           (Conn#connection.peer_settings)#settings.max_frame_size,
-                                           true
-                                          ),
-            NewS = h2_stream_set:update_trailers(FramesToSend, Stream),
+            NewS = h2_stream_set:update_trailers(Trailers, Stream),
             {NewSWS, NewStreams} =
                 h2_stream_set:send_what_we_can(
                   StreamId,
@@ -1026,10 +1020,9 @@ handle_event(_, {send_trailers, StreamId, Headers, Opts},
                     h2_stream_set:update_data_queue(h2_stream_set:queued_data(Stream), BodyComplete, NewS),
                     Conn#connection.streams)),
 
-            send_t(Stream, Headers),
+            send_t(Stream, Trailers),
             {keep_state,
              Conn#connection{
-               encode_context=NewContext,
                send_window_size=NewSWS,
                streams=NewStreams
               }};
@@ -1041,6 +1034,28 @@ handle_event(_, {send_trailers, StreamId, Headers, Opts},
         closed ->
             {keep_state, Conn}
     end;
+
+handle_event(_, {encode_and_send_trailers, StreamId, Headers},
+             #connection{
+                encode_context=EncodeContext,
+                socket = Socket
+               }=Conn
+            ) ->
+    {FramesToSend, NewContext} =
+        h2_frame_headers:to_frames(StreamId,
+                                   Headers,
+                                   EncodeContext,
+                                   (Conn#connection.peer_settings)#settings.max_frame_size,
+                                   true
+                                  ),
+
+    [sock:send(Socket, h2_frame:to_binary(F)) || F <- FramesToSend],
+
+    {keep_state,
+     Conn#connection{
+       encode_context=NewContext
+      }};
+
 handle_event(_, {send_body, StreamId, Body, Opts},
              #connection{}=Conn) ->
     BodyComplete = proplists:get_value(send_end_stream, Opts, true),
