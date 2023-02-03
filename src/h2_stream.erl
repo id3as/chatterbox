@@ -7,6 +7,7 @@
          send_event/2,
          send_pp/2,
          send_data/2,
+         send_trailers/2,
          stream_id/0,
          call/2,
          connection/0,
@@ -96,6 +97,10 @@
             CallbackState :: callback_state()) ->
     {ok, NewState :: callback_state()}.
 
+-callback terminate(
+            CallbackState :: callback_state()) ->
+    any().
+
 %% Public API
 -spec start_link(
         StreamId :: stream_id(),
@@ -128,6 +133,11 @@ send_pp(Pid, Headers) ->
                         ok | flow_control.
 send_data(Pid, Frame) ->
     gen_statem:cast(Pid, {send_data, Frame}).
+
+-spec send_trailers(pid(), hpack:headers()) -> ok.
+send_trailers(Pid, Trailers) ->
+    gen_statem:cast(Pid, {send_trailers, Trailers}),
+    ok.
 
 -spec stream_id() -> stream_id().
 stream_id() ->
@@ -491,6 +501,8 @@ open(cast, {send_data,
                 open
         end,
     {next_state, NextState, Stream};
+open(_, {send_trailers, Trailers}, Stream) ->
+    send_trailers(open, Trailers, Stream);
 open(cast,
   {send_h, Headers},
   #stream_state{}=Stream) ->
@@ -571,6 +583,8 @@ half_closed_remote(cast,
     end;
 
 
+half_closed_remote(_Type, {send_trailers, Trailers}, State) ->
+    send_trailers(half_closed_remote, Trailers, State);
 half_closed_remote(cast, _,
        #stream_state{}=Stream) ->
     rst_stream_(?STREAM_CLOSED, Stream);
@@ -699,14 +713,25 @@ closed(timeout, _,
                      Stream#stream_state.response_body,
                      Stream#stream_state.response_trailers}),
     {stop, normal, Stream};
-closed(cast, {send_t, _Trailers},
-    #stream_state{}) ->
-    keep_state_and_data;
+%% TODO - HERE???
+%% closed(cast, {send_t, _Trailers},
+%%     #stream_state{}) ->
+%%     keep_state_and_data;
 closed(_, _,
        #stream_state{}=Stream) ->
     rst_stream_(?STREAM_CLOSED, Stream);
 closed(Type, Event, State) ->
     handle_event(Type, Event, State).
+
+send_trailers(State, Trailers, Stream=#stream_state{connection=Pid,
+                                                    stream_id=StreamId}) ->
+    h2_connection:actually_send_trailers(Pid, StreamId, Trailers),
+    case State of
+        half_closed_remote ->
+            {next_state, closed, Stream, 0};
+        open ->
+            {next_state, half_closed_local, Stream}
+    end.
 
 handle_event(_, {send_window_update, 0},
              #stream_state{}=Stream) ->
@@ -748,9 +773,13 @@ handle_event(_, _Event, State) ->
 code_change(_OldVsn, StateName, State, _Extra) ->
     {ok, StateName, State}.
 
-terminate(normal, _StateName, _State) ->
+terminate(normal, _StateName, _State=#stream_state{callback_mod=CB,
+                                                  callback_state=CallbackState}) ->
+    callback(CB, terminate, [], CallbackState),
     ok;
-terminate(_Reason, _StateName, _State) ->
+terminate(_Reason, _StateName, _State=#stream_state{callback_mod=CB,
+                                                  callback_state=CallbackState}) ->
+    callback(CB, terminate, [], CallbackState),
     ok.
 
 -spec rst_stream_(error_code(), state()) ->

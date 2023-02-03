@@ -575,7 +575,7 @@ update_all_recv_windows_subset(Delta, PeerSubset) ->
 update_all_send_windows(Delta, Streams) ->
     Streams#stream_set{
       theirs=update_all_send_windows_subset(Delta, Streams#stream_set.theirs),
-      mine=update_all_recv_windows_subset(Delta, Streams#stream_set.mine)
+      mine=update_all_send_windows_subset(Delta, Streams#stream_set.mine)
      }.
 
 update_all_send_windows_subset(Delta, PeerSubset) ->
@@ -722,9 +722,15 @@ s_send_what_we_can(SWS, MFS, #active_stream{}=Stream) ->
     {Frame, SentBytes, NewS} =
         case MaxToSend > QueueSize of
             true ->
-                Flags = case {Stream#active_stream.body_complete, Stream#active_stream.trailers} of
-                         {true, undefined} -> ?FLAG_END_STREAM;
-                         _ -> 0
+                Flags = case Stream#active_stream.body_complete of
+                            true ->
+                                case Stream of
+                                    #active_stream{trailers=undefined} ->
+                                        ?FLAG_END_STREAM;
+                                    _ ->
+                                        0
+                                end;
+                            false -> 0
                         end,
                 %% We have the power to send everything
                 {{#frame_header{
