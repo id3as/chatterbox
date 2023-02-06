@@ -86,7 +86,7 @@
 
 %% The closed_stream record is way more important to a client than a
 %% server. It's a way of holding on to a response that has been
-%% recieved, but not processed by the client yet.
+%% received, but not processed by the client yet.
 -record(
    closed_stream, {
      id               :: stream_id(),
@@ -127,6 +127,7 @@
     new/1,
     new_stream/9,
     get/2,
+    get_by_notify_pid/2,
     upsert/2,
     sort/1
    ]).
@@ -318,6 +319,17 @@ get(Id, StreamSet) ->
                     get_peer_subset(
                       Id,
                       StreamSet)).
+
+-spec get_by_notify_pid(Pid :: pid(),
+          Streams :: stream_set()) ->
+                 stream().
+get_by_notify_pid(Pid, #stream_set{mine = PeerSubset}) ->
+    case lists:keyfind(Pid, #active_stream.notify_pid, PeerSubset#peer_subset.active) of
+        false ->
+            undefined;
+        Stream ->
+            Stream
+    end.
 
 -spec get_from_subset(
         Id :: stream_id(),
@@ -713,14 +725,15 @@ s_send_what_we_can(SWS, MFS, #active_stream{}=Stream) ->
             {true, _} ->
                 {MFS, max_frame_size};
             {false, true} ->
+                %% Connection window is smaller than stream window - we can only send the connection window
                 {SWS, connection};
-            _ ->
+            {false, false} ->
+                %% Stream window
                 {SSWS, stream}
         end,
-
     {Frame, SentBytes, NewS} =
-        case MaxToSend > QueueSize of
-            true ->
+        case {MaxToSend > 0, MaxToSend > QueueSize} of
+            {true, true} ->
                 Flags = case Stream#active_stream.body_complete of
                             true ->
                                 case Stream of
@@ -743,7 +756,8 @@ s_send_what_we_can(SWS, MFS, #active_stream{}=Stream) ->
                  Stream#active_stream{
                    queued_data=done,
                    send_window_size=SSWS-QueueSize}};
-            false ->
+
+            {true, false} ->
                 <<BinToSend:MaxToSend/binary,Rest/binary>> = Stream#active_stream.queued_data,
                 {{#frame_header{
                      stream_id=Stream#active_stream.id,
@@ -754,10 +768,17 @@ s_send_what_we_can(SWS, MFS, #active_stream{}=Stream) ->
                  MaxToSend,
                  Stream#active_stream{
                    queued_data=Rest,
-                   send_window_size=SSWS-MaxToSend}}
+                   send_window_size=SSWS-MaxToSend}};
+
+            {false, _}->
+                {undefined, 0, Stream}
         end,
 
-    _Sent = h2_stream:send_data(Stream#active_stream.pid, Frame),
+    if Frame /= undefined ->
+            _Sent = h2_stream:send_data(Stream#active_stream.pid, Frame);
+       true ->
+            ok
+    end,
 
     NewS1 = case NewS of
                 #active_stream{trailers=undefined} ->

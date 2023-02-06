@@ -163,7 +163,8 @@ rst_stream(Pid, Code) ->
 
 -spec stop(pid()) -> ok.
 stop(Pid) ->
-    gen_statem:stop(Pid).
+  gen_statem:cast(Pid, stop).
+    %%gen_statem:stop(Pid).
 
 init([
       StreamId,
@@ -226,6 +227,8 @@ callback(Mod, Fun, Args, State) ->
     end.
 
 %% Server 'RECV H'
+idle(cast, stop, State) ->
+  {stop, normal, State};
 idle(cast, {recv_h, Headers},
      #stream_state{
         callback_mod=CB,
@@ -280,6 +283,8 @@ idle(cast, {send_h, Headers},
 idle(Type, Event, State) ->
     handle_event(Type, Event, State).
 
+reserved_local(cast, stop, State) ->
+  {stop, normal, State};
 reserved_local(timeout, _,
                #stream_state{
                   callback_state=CallbackState,
@@ -310,6 +315,8 @@ reserved_local(cast, {send_t, Headers},
 reserved_local(Type, Event, State) ->
     handle_event(Type, Event, State).
 
+reserved_remote(cast, stop, State) ->
+  {stop, normal, State};
 reserved_remote(cast, {recv_h, Headers},
                 #stream_state{
                    callback_mod=CB,
@@ -336,6 +343,25 @@ reserved_remote(cast, {recv_t, Headers},
       }};
 reserved_remote(Type, Event, State) ->
     handle_event(Type, Event, State).
+
+open(cast, stop, Stream) ->
+  {stop, normal, Stream};
+
+open(cast, close, Stream) ->
+  %% TODO - callback?
+  {next_state, closed, Stream, 0};
+
+open(cast, {recv_rs, _ErrorCode},
+     #stream_state{
+        callback_mod=CB,
+        callback_state=CallbackState
+       }=Stream) ->
+  {ok, NewCBState} = callback(CB, on_end_stream, [], CallbackState),
+  {next_state,
+   closed,
+   Stream#stream_state{
+     callback_state=NewCBState
+    }, 0};
 
 open(cast, recv_es,
      #stream_state{
@@ -522,6 +548,12 @@ open(Type, Event, State) ->
     handle_event(Type, Event, State).
 
 
+half_closed_remote(cast, stop, State) ->
+  {stop, normal, State};
+half_closed_remote(cast, close, Stream) ->
+  {next_state, closed, Stream, 0};
+half_closed_remote(cast, {recv_es, _ErrorCode}, Stream) ->
+    {next_state, closed, Stream, 0};
 half_closed_remote(cast,
   {send_h, Headers},
   #stream_state{}=Stream) ->
@@ -594,6 +626,12 @@ half_closed_remote(Type, Event, State) ->
 %% half_closed_local, but will create a new stream in the idle state,
 %% but that stream may be ready to transition, it'll make sense, I
 %% hope!
+half_closed_local(cast, stop, State) ->
+  {stop, normal, State};
+half_closed_local(cast, close, Stream) ->
+  {next_state, closed, Stream, 0};
+half_closed_local(cast, {recv_es, _ErrorCode}, Stream) ->
+    {next_state, closed, Stream, 0};
 half_closed_local(cast,
                   {recv_h, Headers},
                   #stream_state{callback_mod=CB,
@@ -703,6 +741,8 @@ half_closed_local(_, _,
 half_closed_local(Type, Event, State) ->
     handle_event(Type, Event, State).
 
+closed(cast, stop, State) ->
+  {stop, normal, State};
 closed(timeout, _,
        #stream_state{}=Stream) ->
     gen_statem:cast(Stream#stream_state.connection,

@@ -22,7 +22,7 @@
          send_headers/4,
          send_trailers/3,
          send_trailers/4,
-         encode_and_send_trailers/3,
+         actually_send_trailers/3,
          send_body/3,
          send_body/4,
          send_request/3,
@@ -322,9 +322,8 @@ send_trailers(Pid, StreamId, Trailers, Opts) ->
     gen_statem:cast(Pid, {send_trailers, StreamId, Trailers, Opts}),
     ok.
 
--spec encode_and_send_trailers(pid(), stream_id(), hpack:headers()) -> ok.
-encode_and_send_trailers(Pid, StreamId, Trailers) ->
-    gen_statem:cast(Pid, {encode_and_send_trailers, StreamId, Trailers}),
+actually_send_trailers(Pid, StreamId, Trailers) ->
+    gen_statem:cast(Pid, {actually_send_trailers, StreamId, Trailers}),
     ok.
 
 -spec send_body(pid(), stream_id(), binary()) -> ok.
@@ -595,17 +594,17 @@ route_frame({H, _Payload},
     case queue:out(SS) of
         {{value, {_Ref, NewSettings}}, NewSS} ->
 
-            UpdatedStreams1 =
+            {UpdatedStreams1, NewConn} =
                 case NewSettings#settings.initial_window_size of
                     undefined ->
-                        ok;
+                        {Streams, Conn};
                     NewIWS ->
                         Delta = NewIWS - OldIWS,
-                        case Delta > 0 of
-                            true -> send_window_update(self(), Delta);
-                            false -> ok
-                        end,
-                        h2_stream_set:update_all_recv_windows(Delta, Streams)
+                        InnerConn = case Delta > 0 of
+                                        true -> send_window_update_(Delta, Conn);
+                                        false -> Conn
+                                    end,
+                        {h2_stream_set:update_all_recv_windows(Delta, Streams), InnerConn}
                 end,
 
             UpdatedStreams2 =
@@ -617,7 +616,7 @@ route_frame({H, _Payload},
                 end,
             {next_state,
              connected,
-             Conn#connection{
+             NewConn#connection{
                streams=UpdatedStreams2,
                settings_sent=NewSS,
                self_settings=NewSettings
@@ -666,15 +665,15 @@ route_frame(F={H=#frame_header{
                     %% Make window size great again
                     h2_frame_window_update:send(Conn#connection.socket,
                                                 L, StreamId),
-                    send_window_update(self(), L),
+                    NewConn = send_window_update_(L, Conn#connection{
+                                                       recv_window_size=CRWS-L
+                                                      }),
                     recv_data(Stream, F),
                     {next_state,
                      connected,
-                     Conn#connection{
-                       recv_window_size=CRWS-L
-                      }};
+                     NewConn};
                 %% Either
-                %% {false, auto, true} or
+                %% {false, auto, false} or
                 %% {false, manual, _DoesntMatter}
                 _Tried ->
                     recv_data(Stream, F),
@@ -687,7 +686,19 @@ route_frame(F={H=#frame_header{
                                  Streams)
                       }}
             end;
-        _ ->
+        closed ->
+            %% TODO - we should remember if we have actually sent a reset...
+            %% If we have reset the stream, then there may still be packets in flight
+            NewConn = case {Conn#connection.flow_control,
+                  L > 0} of
+                {auto, true} ->
+                    h2_frame_window_update:send(Conn#connection.socket,
+                                                L, StreamId),
+                    send_window_update_(L, Conn);
+                _ -> Conn
+            end,
+            {keep_state, NewConn};
+        _Type ->
             go_away(?PROTOCOL_ERROR, Conn)
     end;
 
@@ -785,18 +796,18 @@ route_frame(
       stream_id=StreamId,
       type=?RST_STREAM
       },
-   _Payload},
+   Payload},
   #connection{} = Conn) ->
-    %% TODO: anything with this?
-    %% EC = h2_frame_rst_stream:error_code(Payload),
     Streams = Conn#connection.streams,
     Stream = h2_stream_set:get(StreamId, Streams),
     case h2_stream_set:type(Stream) of
         idle ->
             go_away(?PROTOCOL_ERROR, Conn);
-        _Stream ->
-            %% TODO: RST_STREAM support
-            {next_state, connected, Conn}
+        active ->
+            NewConn = recv_rs(Stream, Conn, h2_frame_rst_stream:error_code(Payload)),
+            {keep_state, NewConn};
+        closed ->
+            {keep_state, Conn}
     end;
 route_frame({H=#frame_header{}, _P},
             #connection{} =Conn)
@@ -897,6 +908,7 @@ route_frame(
     }=Conn) ->
     WSI = h2_frame_window_update:size_increment(Payload),
     NewSendWindow = SWS+WSI,
+
     case NewSendWindow > 2147483647 of
         true ->
             go_away(?FLOW_CONTROL_ERROR, Conn);
@@ -926,6 +938,7 @@ route_frame(
     Streams = Conn#connection.streams,
     WSI = h2_frame_window_update:size_increment(Payload),
     Stream = h2_stream_set:get(StreamId, Streams),
+
     case h2_stream_set:type(Stream) of
         idle ->
             go_away(?PROTOCOL_ERROR, Conn);
@@ -934,7 +947,6 @@ route_frame(
         active ->
             SWS = Conn#connection.send_window_size,
             NewSSWS = h2_stream_set:send_window_size(Stream)+WSI,
-
             case NewSSWS > 2147483647 of
                 true ->
                     rst_stream(Stream, ?FLOW_CONTROL_ERROR, Conn);
@@ -971,6 +983,7 @@ handle_event(_, {stream_finished,
               Trailers},
              Conn) ->
     Stream = h2_stream_set:get(StreamId, Conn#connection.streams),
+
     case h2_stream_set:type(Stream) of
         active ->
             NotifyPid = h2_stream_set:notify_pid(Stream),
@@ -1001,24 +1014,33 @@ handle_event(_, {stream_finished,
             %% stream finished multiple times
             {keep_state, Conn}
     end;
-handle_event(_, {send_window_update, 0}, Conn) ->
-    {keep_state, Conn};
-handle_event(_, {send_window_update, Size},
-             #connection{
-                recv_window_size=CRWS,
-                socket=Socket
-                }=Conn) ->
-    ok = h2_frame_window_update:send(Socket, Size, 0),
-    {keep_state,
-     Conn#connection{
-       recv_window_size=CRWS+Size
-      }};
+handle_event(_, {send_window_update, Size}, Conn) ->
+    NewConn = send_window_update_(Size, Conn),
+    {keep_state, NewConn};
 handle_event(_, {update_settings, Http2Settings},
              #connection{}=Conn) ->
     {keep_state,
      send_settings(Http2Settings, Conn)};
 handle_event(_, {send_headers, StreamId, Headers, Opts}, Conn) ->
     send_headers_(StreamId, Headers, Opts, Conn);
+handle_event(_, {actually_send_trailers, StreamId, Trailers}, Conn=#connection{encode_context=EncodeContext,
+                                                                               streams=Streams,
+                                                                               socket=Socket}) ->
+    Stream = h2_stream_set:get(StreamId, Streams),
+        {FramesToSend, NewContext} =
+        h2_frame_headers:to_frames(h2_stream_set:stream_id(Stream),
+                                   Trailers,
+                                   EncodeContext,
+                                   (Conn#connection.peer_settings)#settings.max_frame_size,
+                                   true
+                                  ),
+
+    [sock:send(Socket, h2_frame:to_binary(Frame)) || Frame <- FramesToSend],
+        {keep_state,
+     Conn#connection{
+              encode_context=NewContext
+
+      }};
 handle_event(_, {send_trailers, StreamId, Trailers, Opts},
              #connection{
                 streams = Streams,
@@ -1054,27 +1076,6 @@ handle_event(_, {send_trailers, StreamId, Trailers, Opts},
             {keep_state, Conn}
     end;
 
-handle_event(_, {encode_and_send_trailers, StreamId, Headers},
-             #connection{
-                encode_context=EncodeContext,
-                socket = Socket
-               }=Conn
-            ) ->
-    {FramesToSend, NewContext} =
-        h2_frame_headers:to_frames(StreamId,
-                                   Headers,
-                                   EncodeContext,
-                                   (Conn#connection.peer_settings)#settings.max_frame_size,
-                                   true
-                                  ),
-
-    [sock:send(Socket, h2_frame:to_binary(F)) || F <- FramesToSend],
-
-    {keep_state,
-     Conn#connection{
-       encode_context=NewContext
-      }};
-
 handle_event(_, {send_body, StreamId, Body, Opts},
              #connection{}=Conn) ->
     BodyComplete = proplists:get_value(send_end_stream, Opts, true),
@@ -1095,7 +1096,6 @@ handle_event(_, {send_body, StreamId, Body, Opts},
                   h2_stream_set:upsert(
                     h2_stream_set:update_data_queue(NewBody, BodyComplete, Stream),
                     Conn#connection.streams)),
-
             {keep_state,
              Conn#connection{
                send_window_size=NewSWS,
@@ -1315,6 +1315,39 @@ handle_event(info, {ssl_error, Socket, Reason},
                socket={ssl,Socket}
               }=Conn) ->
     handle_socket_error(Reason, Conn);
+handle_event(info, {'DOWN', _MonitorRef, process, Pid, _Info}, Conn) ->
+    case h2_stream_set:get_by_notify_pid(Pid, Conn#connection.streams) of
+        undefined ->
+            ok;
+        Stream ->
+            case h2_stream_set:type(Stream) of
+                active ->
+                    StreamId = h2_stream_set:stream_id(Stream),
+                    timer:send_after(100, {resetStream, StreamId});
+                _ ->
+                    ok
+            end
+    end,
+    {keep_state, Conn};
+
+handle_event(info, {resetStream, StreamId}, Conn) ->
+    Stream = h2_stream_set:get(StreamId, Conn#connection.streams),
+    case h2_stream_set:type(Stream) of
+        active ->
+            RstStream = h2_frame_rst_stream:new(?STREAM_CLOSED),
+            RstStreamBin = h2_frame:to_binary(
+                          {#frame_header{
+                              stream_id=StreamId
+                             },
+                           RstStream}),
+            sock:send(Conn#connection.socket, RstStreamBin),
+
+            h2_stream:send_event(h2_stream_set:pid(Stream), close),
+            {keep_state, Conn};
+        _ ->
+            {keep_state, Conn}
+    end;
+
 handle_event(info, {_,R},
            #connection{}=Conn) ->
     handle_socket_error(R, Conn);
@@ -1351,6 +1384,7 @@ new_stream_(From, CallbackMod, CallbackState, NotifyPid, Conn=#connection{stream
                 %% tried to create new_stream but there are too many
                 {{error, Code}, Streams};
             {Pid, GoodStreamSet} ->
+                erlang:monitor(process, NotifyPid),
                 {{NextId, Pid}, GoodStreamSet}
         end,
     {keep_state, Conn#connection{
@@ -1378,6 +1412,7 @@ new_stream_(From, CallbackMod, CallbackState, Headers, Opts, NotifyPid, Conn=#co
                 %% tried to create new_stream but there are too many
                 {{error, Code}, Streams};
             {Pid, GoodStreamSet} ->
+                erlang:monitor(process, NotifyPid),
                 {{NextId, Pid}, GoodStreamSet}
         end,
 
@@ -1572,11 +1607,15 @@ handle_socket_data(<<>>,
                      }=Conn) ->
     active_once(Socket),
     {keep_state, Conn};
-handle_socket_data(Data,
-                   #connection{
-                      socket=Socket,
-                      buffer=Buffer
-                     }=Conn) ->
+handle_socket_data(Data, Conn) ->
+    handle_socket_data_(Data, Conn, keep_state).
+
+handle_socket_data_(Data,
+                    #connection{
+                       socket=Socket,
+                       buffer=Buffer
+                      }=Conn,
+                    NextState) ->
     More =
         case sock:recv(Socket, 0, 0) of %% fail fast
             {ok, Rest} ->
@@ -1606,27 +1645,41 @@ handle_socket_data(Data,
     case h2_frame:recv(ToParse) of
         %% We got a full frame, ship it off to the FSM
         {ok, Frame, Rem} ->
-            gen_statem:cast(self(), {frame, Frame}),
-            handle_socket_data(Rem, NewConn);
+            case route_frame(Frame, NewConn) of
+                {keep_state, NewConn2} ->
+                    handle_socket_data_(Rem, NewConn2, NextState);
+                {next_state, StateName, NewConn2} ->
+                    handle_socket_data_(Rem, NewConn2, {next_state, StateName})
+            end;
+            %% gen_statem:cast(self(), {frame, Frame}),
+            %% handle_socket_data_(Rem, NewConn);
         %% Not enough bytes left to make a header :(
         {not_enough_header, Bin} ->
             %% This is a situation where more bytes should come soon,
             %% so let's switch back to active, once
             active_once(Socket),
-            {keep_state, NewConn#connection{buffer={binary, Bin}}};
+            handle_socket_data_ret(NextState, NewConn#connection{buffer={binary, Bin}});
         %% Not enough bytes to make a payload
         {not_enough_payload, Header, Bin} ->
             %% This too
             active_once(Socket),
-            {keep_state, NewConn#connection{buffer={frame, Header, Bin}}};
+            handle_socket_data_ret(NextState, NewConn#connection{buffer={frame, Header, Bin}});
         {error, 0, Code, _Rem} ->
             %% Remaining Bytes don't matter, we're closing up shop.
             go_away(Code, NewConn);
         {error, StreamId, Code, Rem} ->
             Stream = h2_stream_set:get(StreamId, Conn#connection.streams),
             rst_stream(Stream, Code, NewConn),
-            handle_socket_data(Rem, NewConn)
+            handle_socket_data_(Rem, NewConn, NextState)
     end.
+
+handle_socket_data_ret(keep_state, Conn) ->
+    {keep_state, Conn};
+
+handle_socket_data_ret({next_state, State}, Conn) ->
+    {next_state, State, Conn}.
+
+
 
 handle_socket_passive(Conn) ->
     {keep_state, Conn}.
@@ -1764,6 +1817,26 @@ recv_es(Stream, Conn) ->
             rst_stream(Stream, ?STREAM_CLOSED, Conn)
     end.
 
+-spec recv_rs(Stream :: h2_stream_set:stream(),
+              Conn :: connection(),
+              ErrorCode :: error_code()) ->
+                     ok.
+recv_rs(Stream, Conn, ErrorCode) ->
+    case h2_stream_set:type(Stream) of
+        active ->
+            Pid = h2_stream_set:pid(Stream),
+            h2_stream:send_event(Pid, {recv_rs, ErrorCode});
+        _ ->
+            ok
+    end,
+    {_NewStream, NewStreams} =
+        h2_stream_set:close(
+          Stream,
+          garbage,
+          Conn#connection.streams),
+
+    Conn#connection{streams = NewStreams}.
+
 -spec recv_pp(h2_stream_set:stream(),
               hpack:headers()) ->
                      ok.
@@ -1812,3 +1885,15 @@ send_request(NextId, NotifyPid, Conn, Streams, Headers, Body) ->
 
             {ok, GoodStreamSet}
     end.
+
+
+send_window_update_(0, Conn) ->
+    Conn;
+send_window_update_(Size, #connection{
+                             recv_window_size=CRWS,
+                             socket=Socket
+                            }=Conn) ->
+    ok = h2_frame_window_update:send(Socket, Size, 0),
+    Conn#connection{
+      recv_window_size=CRWS+Size
+     }.
