@@ -1824,18 +1824,26 @@ recv_es(Stream, Conn) ->
 recv_rs(Stream, Conn, ErrorCode) ->
     case h2_stream_set:type(Stream) of
         active ->
+            NotifyPid = h2_stream_set:notify_pid(Stream),
             Pid = h2_stream_set:pid(Stream),
-            h2_stream:send_event(Pid, {recv_rs, ErrorCode});
-        _ ->
-            ok
-    end,
-    {_NewStream, NewStreams} =
-        h2_stream_set:close(
-          Stream,
-          garbage,
-          Conn#connection.streams),
+            StreamId = h2_stream_set:stream_id(Stream),
+            h2_stream:send_event(Pid, {recv_rs, ErrorCode}),
+            {_NewStream, NewStreams} =
+                h2_stream_set:close(
+                  Stream,
+                  garbage,
+                  Conn#connection.streams),
+            case {Conn#connection.type, is_pid(NotifyPid)} of
+                {client, true} ->
+                    NotifyPid ! {'END_STREAM', StreamId};
+                _ ->
+                    ok
+            end,
 
-    Conn#connection{streams = NewStreams}.
+            Conn#connection{streams = NewStreams};
+        _ ->
+            Conn
+    end.
 
 -spec recv_pp(h2_stream_set:stream(),
               hpack:headers()) ->
